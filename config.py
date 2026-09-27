@@ -68,3 +68,13 @@ POLL_TIMEOUT = _env_int("POLL_TIMEOUT", 30)
 # Seconds to wait between send retries on transient errors
 RETRY_DELAY = float(os.environ.get("RETRY_DELAY", "1.0"))
 MAX_RETRIES = _env_int("MAX_RETRIES", 5)
+
+# ── Standby / handshake tuning ──────────────────────────────────────
+# The "active" side (iran_side) sends a HELLO right away and then a
+# keepalive HELLO every KEEPALIVE_INTERVAL seconds, plus a BYE on clean
+# shutdown. The "standby" side (foreign_side) stays idle — no SOCKS5
+# listener, no traffic relay — until it sees a HELLO, and falls back to
+# idle if it gets a BYE or hears nothing for IDLE_TIMEOUT seconds.
+# IDLE_TIMEOUT must be comfortably larger than KEEPALIVE_INTERVAL.
+KEEPALIVE_INTERVAL = _env_int("KEEPALIVE_INTERVAL", 20)
+IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT", 75)

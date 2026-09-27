@@ -10,6 +10,8 @@ Actions:
     CONNECT  – open a new TCP connection (payload = host:port)
     DATA     – tunnel data chunk
     CLOSE    – tear down the connection
+    HELLO    – control message: peer is active / keepalive
+    BYE      – control message: peer is shutting down cleanly
 """
 
 from __future__ import annotations
@@ -25,11 +27,16 @@ codec = EmojiCodec(config.ALPHABET)
 
 SEPARATOR = "|"
 
+# conn_id used for control messages (HELLO/BYE) — never a real connection.
+CONTROL_CONN_ID = "ctl"
+
 
 class Action(str, Enum):
     CONNECT = "C"
     DATA = "D"
     CLOSE = "X"
+    HELLO = "H"
+    BYE = "B"
 
 
 @dataclass

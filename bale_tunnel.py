@@ -18,6 +18,7 @@ import asyncio
 import logging
 import signal
 import struct
+import time
 
 import config
 from bale_transport import BaleTransport
@@ -27,6 +28,7 @@ from tunnel_protocol import (
     ReassemblyBuffer,
     chunk_data,
     new_conn_id,
+    CONTROL_CONN_ID,
 )
 
 
@@ -139,8 +141,21 @@ async def run_tunnel(
     rx_chat_id: int | str,
     socks_host: str,
     socks_port: int,
+    mode: str = "active",
 ):
-    """Run a tunnel node: SOCKS5 server + TCP forwarder, sharing one bot."""
+    """Run a tunnel node: SOCKS5 server + TCP forwarder, sharing one bot.
+
+    mode="active"  (iran_side): starts immediately, and broadcasts a HELLO
+        on startup plus a keepalive HELLO every KEEPALIVE_INTERVAL seconds,
+        and a BYE on clean shutdown, so the standby side knows when to
+        wake up and when to go back to sleep.
+    mode="standby" (foreign_side): stays idle — no SOCKS5 listener, no
+        traffic relaying — until it receives a HELLO from the peer. Goes
+        back to idle on a BYE, or automatically if no HELLO/keepalive is
+        heard for IDLE_TIMEOUT seconds (covers a peer that crashed instead
+        of shutting down cleanly).
+    """
+    assert mode in ("active", "standby")
     log = logging.getLogger(name)
     transport = BaleTransport(bot_token)
 
@@ -151,9 +166,35 @@ async def run_tunnel(
     # Connections we terminate as TCP forwarder.
     tcp_connections: dict[str, TunnelConnection] = {}
 
+    server: asyncio.base_events.Server | None = None
+    last_peer_seen: float = 0.0
+
+    async def start_session():
+        nonlocal server
+        if server is not None:
+            return
+        server = await asyncio.start_server(handle_socks_client, socks_host, socks_port)
+        log.info("session ACTIVE — SOCKS5 proxy listening on %s:%d", socks_host, socks_port)
+
+    async def stop_session(reason: str):
+        nonlocal server
+        if server is None:
+            return
+        s, server = server, None
+        s.close()
+        await s.wait_closed()
+        for conn in list(tcp_connections.values()):
+            await conn.close()
+        tcp_connections.clear()
+        for q in list(socks_queues.values()):
+            await q.put(None)
+        socks_queues.clear()
+        log.info("session ENDED (%s) — back to standby, no traffic relayed", reason)
+
     async def poller():
         socks_reassemblers: dict[str, ReassemblyBuffer] = {}
-        log.info("poller started (rx channel %s)", rx_chat_id)
+        nonlocal last_peer_seen
+        log.info("poller started (rx channel %s, mode=%s)", rx_chat_id, mode)
         while True:
             texts = await transport.poll(rx_chat_id)
             for text in texts:
@@ -162,6 +203,25 @@ async def run_tunnel(
                 except Exception:
                     continue
                 cid = msg.conn_id
+
+                # ── Control messages (HELLO / BYE) ──────────────────
+                if cid == CONTROL_CONN_ID:
+                    if msg.action == Action.HELLO:
+                        last_peer_seen = time.monotonic()
+                        if mode == "standby" and server is None:
+                            log.info("HELLO received — waking up")
+                            await start_session()
+                    elif msg.action == Action.BYE:
+                        if mode == "standby":
+                            await stop_session("peer said BYE")
+                    continue
+
+                # In standby mode, ignore any real traffic until a HELLO
+                # has actually started a session (defensive; shouldn't
+                # normally happen since HELLO always precedes traffic).
+                if mode == "standby" and server is None:
+                    log.warning("[%s] dropped %s — no active session (peer hasn't said HELLO)", cid, msg.action)
+                    continue
 
                 # We are the SOCKS5 server side for this conn
                 if cid in socks_queues:
@@ -201,6 +261,21 @@ async def run_tunnel(
                     else:
                         fail = TunnelMessage(conn_id=cid, seq=0, action=Action.CLOSE)
                         await transport.send(tx_chat_id, fail.encode_to_text())
+
+    async def watchdog():
+        """standby only: fall back to idle if the peer goes silent."""
+        check_every = max(2, min(10, config.IDLE_TIMEOUT // 3))
+        while True:
+            await asyncio.sleep(check_every)
+            if server is not None and (time.monotonic() - last_peer_seen) > config.IDLE_TIMEOUT:
+                await stop_session(f"no HELLO for {config.IDLE_TIMEOUT}s")
+
+    async def keepalive():
+        """active only: announce presence so the peer wakes up / stays up."""
+        hello = TunnelMessage(conn_id=CONTROL_CONN_ID, seq=0, action=Action.HELLO)
+        while True:
+            await transport.send(tx_chat_id, hello.encode_to_text())
+            await asyncio.sleep(config.KEEPALIVE_INTERVAL)
 
     async def handle_socks_client(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -266,8 +341,12 @@ async def run_tunnel(
 
     asyncio.create_task(poller())
 
-    server = await asyncio.start_server(handle_socks_client, socks_host, socks_port)
-    log.info("SOCKS5 proxy listening on %s:%d", socks_host, socks_port)
+    if mode == "active":
+        await start_session()
+        asyncio.create_task(keepalive())
+    else:
+        log.info("standing by on channel %s — waiting for peer HELLO before doing anything", rx_chat_id)
+        asyncio.create_task(watchdog())
 
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
@@ -277,10 +356,9 @@ async def run_tunnel(
     try:
         await stop
     finally:
-        server.close()
-        await server.wait_closed()
-        for conn in list(tcp_connections.values()):
-            await conn.close()
-        tcp_connections.clear()
+        if mode == "active":
+            bye = TunnelMessage(conn_id=CONTROL_CONN_ID, seq=0, action=Action.BYE)
+            await transport.send(tx_chat_id, bye.encode_to_text())
+        await stop_session("shutdown")
         await transport.close()
         log.info("shutdown complete")

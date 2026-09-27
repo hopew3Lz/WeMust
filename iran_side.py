@@ -34,4 +34,5 @@ if __name__ == "__main__":
         rx_chat_id=config.DOWNSTREAM_CHAT_ID, # iran receives from here
         socks_host=config.SOCKS_HOST,
         socks_port=config.SOCKS_PORT,
+        mode="active",
     ))
