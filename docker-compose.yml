@@ -1,0 +1,33 @@
+# Bale Tunnel — Docker Compose.
+#
+# Each side runs on its own server, so start only the service you need:
+#   docker compose up -d iran      # on the server inside Iran
+#   docker compose up -d foreign   # on the server outside Iran
+#
+# config.py is bind-mounted, so you can change tokens and just restart
+# (`docker compose restart`) — no image rebuild required.
+#
+# NOTE: set SOCKS_HOST = "0.0.0.0" in config.py so the proxy is reachable
+# from outside the container. The published port below is still bound to
+# the host's 127.0.0.1 only.
+
+services:
+  iran:
+    build: .
+    image: bale-tunnel
+    command: iran_side.py
+    volumes:
+      - ./config.py:/app/config.py:ro
+    ports:
+      - "127.0.0.1:1080:1080"
+    restart: unless-stopped
+
+  foreign:
+    build: .
+    image: bale-tunnel
+    command: foreign_side.py
+    volumes:
+      - ./config.py:/app/config.py:ro
+    ports:
+      - "127.0.0.1:1080:1080"
+    restart: unless-stopped
